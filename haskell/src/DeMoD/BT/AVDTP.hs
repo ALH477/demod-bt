@@ -24,6 +24,7 @@ module DeMoD.BT.AVDTP
   , close
   , abort
     -- * Event-Driven Transitions
+  , AVDTPEvent (..)
   , driveEvent
     -- * Queries
   , sessionCodec

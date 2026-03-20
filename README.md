@@ -2,86 +2,86 @@
 
 **FOSS Bluetooth Audio Sink/Source Library**
 
-A dual-language Bluetooth audio library that turns any Linux machine into a Bluetooth speaker or audio source. Haskell manages protocol state with compile-time safety guarantees. Rust handles real-time audio with zero garbage-collector pauses. Nix packages and deploys the whole stack declaratively.
+A dual-language Bluetooth audio library that turns any Linux machine into a Bluetooth speaker or audio source. Haskell manages protocol state with compile-time safety guarantees. Rust handles D-Bus orchestration and real-time audio. Nix packages and deploys the whole stack declaratively.
 
 Built on the [DeMoD Communications Framework (DCF)](https://github.com/ALH477/DeMoD-Communication-Framework), a handshakeless 17-byte transport protocol validated by the United States Air Force. Originally designed for DeMoD Guitars by Asher, founder of DeMoD LLC.
 
 **LGPL-3.0 | Patent Pending**
 
-## How It Works
+## Status (2026-03-20)
 
-When you run the daemon, four things happen in sequence:
+**Works today**
+- Nix flake builds `packages.{default,rust,haskell}` and provides a dev shell.
+- Rust runtime registers an A2DP SBC endpoint (sink or source) with BlueZ and negotiates high-quality SBC with a version-aware bitpool cap.
+- Rust engine decodes SBC via `libsbc` and plays via CPAL (sink), or captures/encodes for source; PLC is applied on decode errors.
+- Haskell daemon polls events at 20 Hz, auto-acquires transports when they enter `pending`, and drives the AVDTP state machine.
+- AVRCP `MediaPlayer1` is registered; metadata/status/position updates are exposed and headset/car controls are forwarded as events.
+- Volume synchronization is bidirectional: BlueZ VolumeChanged updates local playback; local volume changes propagate back to BlueZ.
+- NixOS module sets up BlueZ, PipeWire, rtkit, and a hardened systemd service with adapter/SCMS-T knobs.
 
-1. **Rust creates a tokio async runtime** and connects to the system D-Bus. It queries BlueZ's ObjectManager to find the first powered Bluetooth adapter (not hardcoded to hci0), then registers an `org.bluez.MediaEndpoint1` interface that advertises SBC codec support. It also registers an `org.bluez.MediaPlayer1` interface for AVRCP metadata. From this point, phones and car stereos can see us as a Bluetooth audio device.
+**Optional / experimental (not in the default hot path)**
+- Adaptive jitter buffer, sample-rate conversion, and device monitor utilities exist as libraries but are not plugged into the engine.
+- DCF framing utilities exist (with tests) but are not used in the Bluetooth A2DP audio path.
+- LC3/AAC endpoint registration is scaffolded but not enabled by default.
+- Haskell `BlueZ.hs` signal parsing helpers are kept for future integration.
 
-2. **A phone connects and BlueZ negotiates the codec.** BlueZ calls our `SelectConfiguration` method with the remote device's SBC capabilities (frequency, channel mode, block length, subbands, bitpool range). Our handler picks the highest quality the remote supports: 44.1kHz Joint Stereo with maximum bitpool, capped at 53 for standard SBC or 76 for SBC-XQ on BlueZ 5.64+. BlueZ then calls `SetConfiguration` with the agreed parameters and creates a `MediaTransport1` D-Bus object.
+For planned work and long-term items, see `ROADMAP.md`.
 
-3. **The Rust runtime acquires the transport file descriptor** by calling `MediaTransport1.Acquire()` on the D-Bus object. This returns a raw Unix fd that carries encoded SBC audio frames. The runtime allocates a fresh lock-free SPSC ring buffer (sized to the jitter buffer depth, default 40ms), creates an SBC decoder context via FFI to the system `libsbc`, and spawns two threads:
+## How It Works (Current Implementation)
 
-   - **BT reader thread** (normal priority): calls `read()` on the transport fd in a loop, feeds the raw bytes through `libsbc`'s `sbc_decode()`, converts the output to interleaved i16 PCM, and pushes samples into the ring buffer producer end. If the ring buffer is full, the frame is dropped and an overrun counter increments.
-
-   - **CPAL audio callback** (OS-managed RT priority): pulls samples from the ring buffer consumer end and writes them to the default PipeWire/ALSA output device. If the ring buffer is empty, it writes silence and increments an underrun counter. Volume scaling applies an atomic i16 multiply (AVRCP 0-127 range mapped via integer division, no floating point in the callback). Zero allocations, zero locks, zero syscalls in this path.
-
-4. **Haskell polls for events at 20 Hz** and drives the AVDTP state machine. Each BlueZ event (device connected, codec negotiated, transport acquired, volume changed, transport released, device disconnected) is mapped to a typed state transition via the `driveEvent` function. The AVDTP state machine is a GADT with `DataKinds`: `Session 'Idle`, `Session 'Configured`, `Session 'Open`, `Session 'Streaming`, and `Session 'Closing` are distinct types. Attempting to call `start :: Session 'Open -> IO (Session 'Streaming)` on an Idle session is a GHC type error, not a runtime crash. A `SomeSession` existential wrapper stores the current state in an `IORef` for the event loop.
-
-When the phone disconnects, the BT reader thread gets EOF from `read()`, sets the `running` atomic flag to false, and exits. The Haskell event loop detects this on the next poll cycle, emits a `TransportReleased` event, drives the AVDTP machine to Idle, and calls `stopStream` on the Rust runtime. The ring buffer is discarded. When the phone reconnects, a brand new ring buffer is allocated (the key reconnection fix: ring buffers are created per-stream, not per-daemon-lifetime), and the cycle repeats.
+1. **Rust initializes a tokio runtime** and connects to system D-Bus. It enumerates adapters via `ObjectManager` (or uses `DEMOD_BT_ADAPTER`) and registers an A2DP SBC `MediaEndpoint1` (sink or source). BlueZ compatibility detection caps SBC bitpool and can enable SCMS-T if required.
+2. **BlueZ negotiates SBC** by calling `SelectConfiguration` and `SetConfiguration`. We choose the highest quality settings supported by the remote within the safe bitpool cap. The transport object is created on D-Bus, and a `TransportPending` event is emitted when state changes to `pending`.
+3. **The Haskell daemon polls for events** via the FFI and drives the AVDTP state machine. When a transport enters `pending`, it calls `demod_bt_acquire_and_start` and transitions the session through Open → Streaming.
+4. **The Rust engine starts streaming** with a fresh lock-free SPSC ring buffer sized from the configured jitter buffer (default 40ms). A BT reader thread decodes frames into PCM, applies PLC on decode errors, and pushes samples into the buffer; the CPAL callback consumes samples for audio output with integer volume scaling.
+5. **AVRCP metadata + commands** are wired: Rust registers `MediaPlayer1`, Haskell updates metadata/status/position through FFI, and playback commands are forwarded to Haskell as events.
 
 ## Architecture
 
 ```
 Phone / Car Stereo
        |
-       | Bluetooth A2DP (SBC/LC3 encoded audio)
+       | Bluetooth A2DP (SBC encoded audio)
        |
   ┌────v────────────────────────────────────────────────────────┐
   |                    bluetoothd (BlueZ)                       |
-  |  Adapter management, pairing, A2DP/AVRCP profile handling  |
+  |  Adapter management, pairing, A2DP/AVRCP profile handling    |
   └────┬──────────────────────────────┬─────────────────────────┘
        | D-Bus (org.bluez.*)          | Transport fd (raw SBC)
        |                              |
   ┌────v──────────────────────────────v─────────────────────────┐
   |                  Rust Data Plane (tokio)                    |
   |                                                             |
-  |  runtime.rs    Async D-Bus orchestration, adapter enum,     |
-  |                transport state monitoring, event dispatch    |
+  |  runtime.rs    D-Bus connection, adapter enum, endpoint      |
+  |                registration, event dispatch                  |
   |                                                             |
-  |  bluez.rs      MediaEndpoint1 (codec negotiation),          |
-  |                MediaTransport1 proxy (fd acquisition)        |
+  |  bluez.rs      MediaEndpoint1 (codec negotiation),           |
+  |                MediaTransport1 proxy (fd acquisition)         |
   |                                                             |
-  |  avrcp.rs      MediaPlayer1 (track metadata, play/pause,   |
-  |                volume, exposed to car stereos via D-Bus)     |
+  |  engine.rs     BT reader thread -> SBC decode ->             |
+  |                ring buffer -> CPAL callback -> DAC            |
   |                                                             |
-  |  engine.rs     BT reader thread -> sbc_decode() ->          |
-  |                ring buffer -> CPAL audio callback -> DAC     |
+  |  codec.rs      Codec trait + SbcCodecLive (libsbc FFI)        |
   |                                                             |
-  |  codec.rs      Codec trait: SbcCodecLive (libsbc FFI),      |
-  |                Lc3CodecLive (liblc3 FFI, feature-gated)      |
+  |  avrcp.rs      MediaPlayer1 interface (registered;            |
+  |                commands + metadata wired)                     |
   |                                                             |
-  |  audio.rs      AdaptiveJitter, LinearResampler,             |
-  |                DeviceMonitor                                 |
+  |  compat.rs     BlueZ version detection + SCMS-T capability    |
   |                                                             |
-  |  dcf.rs        17-byte header + 239-byte payload framing,   |
-  |                fragment/reassembly, CRC-8                    |
+  |  dcf.rs        DCF framing utilities (library, not in path)   |
   |                                                             |
   |  ffi.rs        extern "C" exports for Haskell               |
   |                                                             |
-  ├──────────── C ABI (~2.4ns per call) ────────────────────────┤
+  ├──────────── C ABI (control-plane calls only) ────────────────┤
   |                                                             |
   |                 Haskell Control Plane                        |
   |                                                             |
-  |  BT.hs         Event loop (20 Hz poll), AVDTP driver,       |
-  |                AVRCP command dispatch, metrics reporter       |
+  |  BT.hs         Event loop (20 Hz poll), AVDTP driver          |
   |                                                             |
-  |  AVDTP.hs      Type-safe state machine (GADT + DataKinds),  |
-  |                SomeSession existential for IORef storage      |
+  |  AVDTP.hs      Type-safe state machine (GADT + DataKinds)     |
   |                                                             |
-  |  AVRCP.hs      Command parsing (Play/Pause/Next/Volume),    |
-  |                metadata update API                            |
+  |  AVRCP.hs      Command parsing (via event tags), metadata API |
   |                                                             |
-  |  BlueZ.hs      D-Bus signal parsing (InterfacesAdded,       |
-  |                PropertiesChanged), device/transport events    |
-  |                                                             |
-  |  FFI.hs        foreign import ccall unsafe bindings          |
+  |  FFI.hs        `foreign import ccall unsafe` bindings         |
   |                                                             |
   └──────────────────────────────────┬──────────────────────────┘
                                      |
@@ -92,60 +92,50 @@ Phone / Car Stereo
 
 ## The FFI Boundary
 
-The Haskell-Rust boundary uses `foreign import ccall unsafe` on the Haskell side and `#[no_mangle] extern "C"` on the Rust side. The `unsafe` qualifier tells GHC not to synchronize its garbage collector before the call, reducing overhead from ~50ns to ~2.4ns. This is safe because the Rust functions never call back into Haskell and complete in microseconds.
+The Haskell-Rust boundary uses `foreign import ccall unsafe` on the Haskell side and `#[no_mangle] extern "C"` on the Rust side. The `unsafe` qualifier skips GC synchronization, which keeps per-call overhead low for the control-plane calls that happen at Hz scale. Audio samples never cross this boundary.
 
-Audio data never crosses this boundary. The BT reader thread, ring buffer, and CPAL callback all live entirely within Rust. The only things crossing the FFI are:
+What crosses the FFI today:
+- `demod_bt_init` / `demod_bt_shutdown`
+- `demod_bt_register`
+- `demod_bt_poll_event`
+- `demod_bt_acquire_and_start` / `demod_bt_start_stream` / `demod_bt_stop_stream`
+- `demod_bt_get_metrics`
+- `demod_bt_set_volume` / `demod_bt_set_volume_remote` / `demod_bt_get_volume`
+- `demod_bt_update_metadata` / `demod_bt_update_playback_status` / `demod_bt_update_playback_position`
 
-- `demod_bt_init` / `demod_bt_shutdown` (once each)
-- `demod_bt_register` (once)
-- `demod_bt_poll_event` (20 times per second)
-- `demod_bt_acquire_and_start` / `demod_bt_stop_stream` (on connect/disconnect)
-- `demod_bt_get_metrics` (every 5 seconds)
-- `demod_bt_set_volume` / `demod_bt_get_volume` (on AVRCP volume events)
+Struct layout notes (must match Haskell `Storable`):
+- `MetricsSnapshot` is `#[repr(C)]` with 4 `u32`s + a `u8` running flag (total size 20 with padding).
+- `FfiEvent` is `#[repr(C)]` with offsets: `event_type` (0), `fd` (4), `read_mtu` (8), `write_mtu` (12), `string_data` pointer (16). The string must be freed with `demod_bt_free_string`.
 
-The `MetricsSnapshot` struct is `repr(C, packed)` with `u8` for the boolean `running` field (not Rust `bool`, which would add 3 bytes of padding that Haskell's `Storable` instance doesn't account for). The `FfiEvent` struct uses `repr(C)` with fixed byte offsets hardcoded in the Haskell peek implementation: `event_type` at 0, `fd` at 4, `read_mtu` at 8, `write_mtu` at 12, `string_data` pointer at 16.
+## Codec Support (Current)
 
-## Codec Support
+| Codec | Library | Status | Notes |
+|---|---|---|---|
+| SBC | System `libsbc` via FFI | Implemented | Registered with BlueZ; decode/encode in engine. Bitpool capped via BlueZ compatibility (53–76). |
+| LC3 | System `liblc3` via FFI | Compile-time only | Requires `has_lc3` and a separate endpoint registration (not done yet). |
+| AAC | `fdk-aac` via FFI | Not implemented | `build.rs` probes for the library but no codec implementation is wired. |
 
-The engine uses a `Codec` trait that abstracts encode/decode operations. The BT reader thread calls `codec.decode_frame()` through the trait; swapping SBC for LC3 requires only adding a new implementation and extending the `create_codec` factory. The engine code is untouched.
+## BlueZ Compatibility (Current)
 
-| Codec | Library | Status | Typical Frame | Fits 239B DCF? |
-|---|---|---|---|---|
-| SBC | System `libsbc` via FFI | Production | 119B (HQ) / 164B (XQ) | Yes |
-| LC3 | System `liblc3` via FFI | Feature-gated (`has_lc3` cfg) | 120B (96kbps/10ms) | Yes |
-| AAC | System `fdk-aac` via FFI | Planned | 256B | Yes |
+The `compat.rs` module is integrated into the runtime:
+- **Version-aware bitpool cap**: older BlueZ versions default to 53; newer versions allow SBC‑XQ up to 76.
+- **SCMS‑T support**: if endpoint registration fails with a content-protection error, the runtime retries with SCMS‑T enabled. You can force it via `DEMOD_BT_ENABLE_SCMS_T=1`.
+- **Adapter override**: set `DEMOD_BT_ADAPTER=/org/bluez/hciN` to pin to a specific adapter.
 
-The `build.rs` script probes for each library via `pkg-config` and emits `cargo:rustc-cfg=has_lc3` etc. so codec modules are conditionally compiled. It also compiles a tiny C program to determine `sizeof(sbc_t)` on the build platform, writing the result to `$OUT_DIR/sbc_sizes.rs` to prevent stack corruption from struct size mismatches between x86_64 and aarch64.
+## DCF Framing
 
-SBC frame-level packet loss concealment (PLC) uses exponential fade-out: each consecutive lost frame attenuates by 6dB (arithmetic right-shift), fading to silence after 8 losses (~23ms). LC3 has built-in PLC via Annex B, invoked by calling `lc3_decode()` with NULL input.
+The Rust `dcf.rs` and Haskell `DCF.hs` modules implement DCF framing (17-byte header + payload) and include tests and helpers. This code is **not currently used in the Bluetooth audio path**, which reads and writes raw A2DP frames from the BlueZ transport fd.
 
-## BlueZ Compatibility
+## Audio Processing Utilities
 
-The `compat.rs` module detects the installed BlueZ version via `bluetoothd --version` and applies workarounds:
+`rust/src/audio.rs` contains utilities for:
+- Adaptive jitter buffer sizing
+- Linear resampling (sample-rate conversion)
+- Default output device monitoring
 
-| BlueZ Version | Issue | Workaround |
-|---|---|---|
-| 5.83-5.84 | A2DP auto-connect regression on startup | Manual profile connection retry |
-| < 5.64 | SBC-XQ bitpool > 53 may cause garbled audio | Cap bitpool at 53 |
-| >= 5.66 | LE Audio experimental features available | Enable LC3 endpoint if configured |
-
-SCMS-T content protection is handled with a retry strategy: first attempt without SCMS-T (most devices don't require it), then retry with SCMS-T enabled (`cp_type = 0x0002`, `copy_byte = 0x00` unrestricted) if BlueZ rejects the connection.
-
-## DCF Packetization
-
-Audio codec frames are wrapped in the DCF 17-byte header (`type` + `sequence` + `timestamp` + `payload_len`) with a 239-byte payload, producing 256-byte power-of-2 aligned packets. The 17-byte DCF overhead matches the native A2DP protocol overhead (4B L2CAP + 12B AVDTP/RTP + 1B SBC header = 17B) exactly. All standard codec frames fit in a single DCF packet without fragmentation.
-
-For frames exceeding 239 bytes (rare), the fragmenter splits across multiple DCF packets with a 7-byte fragment header (frame_id, fragment_index, fragment_count, offset, flags) and FIRST/MIDDLE/LAST/COMPLETE flag bits.
-
-## Audio Processing
-
-The `audio.rs` module provides three utilities:
-
-**Adaptive jitter buffer.** Tracks BT packet inter-arrival variance with an exponential moving average (alpha = 0.02, ~50 packet window). Target depth = mean + 3*sigma (99.7% coverage), clamped between 10ms and 200ms. This replaces the fixed 40ms default with a dynamically optimized depth.
-
-**Sample rate conversion.** Linear interpolation resampler for when the negotiated codec rate (e.g., 44100) differs from the output device rate (e.g., 48000). Zero allocation, safe for the RT audio callback. Returns `None` if rates match.
-
-**Device monitoring.** Polls the CPAL default output device name every metrics cycle. If the device changes (HDMI plugged in, USB DAC connected), flags it so the engine can restart on the new device.
+PLC is integrated into the engine (decode-error concealment). The adaptive jitter buffer,
+resampler, and device monitor remain available as library utilities but are not in the default
+streaming path yet.
 
 ## NixOS Deployment
 
@@ -161,8 +151,10 @@ The `audio.rs` module provides three utilities:
           services.demod-bt = {
             enable = true;
             direction = "sink";            # "sink" or "source"
+            adapter = null;                # or "/org/bluez/hci1"
             deviceName = "DeMoD BT Speaker";
             discoverable = true;
+            enableScmsT = false;           # force SCMS-T if needed
             sampleRate = 44100;
             channels = 2;
             jitterBufferMs = 40;
@@ -177,73 +169,55 @@ The `audio.rs` module provides three utilities:
 }
 ```
 
-The NixOS module configures: BlueZ (powered, discoverable, device class 0x240414 Audio/Video speaker), PipeWire (ALSA + PulseAudio + JACK compat, SBC-XQ and all codecs enabled), WirePlumber (auto-profile-switch disabled to preserve A2DP during music), rtkit (real-time priority for PipeWire and our daemon), PAM limits (unlimited memlock, rtprio 95/99 for the audio group), and a hardened systemd service (`ProtectSystem=strict`, `NoNewPrivileges`, `LimitRTPRIO=95`, `LimitMEMLOCK=infinity`).
-
-## Target Platforms
-
-| Platform | CPU | Bluetooth | Notes |
-|---|---|---|---|
-| NixOS Desktop (Framework 16) | x86_64 | USB dongle (BT 5.0+) | Primary dev target |
-| ArchibaldOS (Orange Pi 5 Max) | aarch64 (RK3588) | Onboard BT 5.3 (AP6611S) | Base OPi5 has no BT; 5B has BT 5.0 |
-| ArchibaldOS (Raspberry Pi 4/5) | aarch64 | USB dongle recommended | Onboard CYW43455 shares antenna with WiFi |
-| Generic NixOS | x86_64 / aarch64 | Any BlueZ-supported | Nix flake targets both |
-
-Raspberry Pi's onboard CYW43455 (BT 5.0) causes documented audio dropouts during concurrent WiFi activity due to shared antenna. Use a USB dongle: ASUS USB-BT500 (BT 5.0), TP-Link UB500 (BT 5.0), or UGREEN CM591 (BT 5.3 for LE Audio).
+The NixOS module configures BlueZ, PipeWire, WirePlumber codec flags, rtkit, PAM limits, and a hardened systemd service.
 
 ## Quick Start
 
 ```bash
 nix develop            # enter dev shell with all deps
 cd rust && cargo build # build the Rust data plane
-cd rust && cargo test  # run DCF framing tests
+cd rust && cargo test  # run unit tests (DCF framing, audio utilities)
 just run-sink          # run as Bluetooth speaker
 just bt-status         # check adapter state
 just dcf-overhead      # print DCF payload analysis
 ```
 
+## Runtime Configuration (Env)
+
+- `DEMOD_BT_DIRECTION` = `sink` or `source`
+- `DEMOD_BT_SAMPLE_RATE` = sample rate (Hz), e.g. `44100`
+- `DEMOD_BT_CHANNELS` = `1` or `2`
+- `DEMOD_BT_JITTER_MS` = jitter buffer depth in ms
+- `DEMOD_BT_DCF_PAYLOAD` = DCF payload size (bytes)
+- `DEMOD_BT_ADAPTER` = BlueZ adapter path override (e.g., `/org/bluez/hci1`)
+- `DEMOD_BT_ENABLE_SCMS_T` = `1` to force SCMS-T capability
+
 ## Project Structure
 
 ```
-demod-bt/                        31 files, 7,235 lines
-|
 +-- flake.nix                    Nix flake (crane + callCabal2nix)
 +-- justfile                     Development task runner
-+-- ROADMAP.md                   Production roadmap (18/18 done)
++-- ROADMAP.md                   Production roadmap
 +-- LICENSE                      LGPL-3.0
++
++-- rust/                        Rust data plane
+|   +-- runtime.rs               Tokio runtime, D-Bus connection, adapter enum
+|   +-- bluez.rs                 MediaEndpoint1 + transport acquisition
+|   +-- engine.rs                BT reader/writer threads + CPAL streams
+|   +-- codec.rs                 Codec trait + SBC implementation
+|   +-- avrcp.rs                 MediaPlayer1 interface (registered)
+|   +-- compat.rs                BlueZ version detection + SCMS-T helpers
+|   +-- dcf.rs                   DCF framing library + tests
+|   +-- ffi.rs                   C ABI exports for Haskell
 |
-+-- rust/                        Rust data plane (3,988 lines)
-|   +-- Cargo.toml               Dependencies: zbus 5, tokio, cpal, rtrb, byteorder
-|   +-- build.rs                 pkg-config probes + SBC struct size probe
-|   +-- src/
-|       +-- lib.rs               Crate root, module declarations
-|       +-- runtime.rs           Tokio async runtime, D-Bus connection, adapter enum
-|       +-- bluez.rs             MediaEndpoint1 (codec negotiation), transport proxy
-|       +-- avrcp.rs             MediaPlayer1 (metadata, play/pause, volume)
-|       +-- engine.rs            BT reader/writer threads, CPAL audio streams
-|       +-- codec.rs             Codec trait + SbcCodecLive + Lc3CodecLive
-|       +-- sbc_ffi.rs           Raw FFI to system libsbc
-|       +-- lc3_ffi.rs           Raw FFI to system liblc3 (feature-gated)
-|       +-- dcf.rs               17-byte header, fragmentation, CRC-8
-|       +-- transport.rs         AudioPipeline, ring buffer factory, metrics
-|       +-- audio.rs             Adaptive jitter, resampler, device monitor
-|       +-- compat.rs            BlueZ version detection, SCMS-T handling
-|       +-- ffi.rs               C ABI exports for Haskell (20 functions)
-|       +-- ffi.h                C header for the Haskell FFI consumer
-|
-+-- haskell/                     Haskell control plane (1,588 lines)
-|   +-- demod-bt.cabal           Package config, links to libdemod_bt
++-- haskell/                     Haskell control plane
 |   +-- app/Main.hs              Daemon entry point
-|   +-- src/DeMoD/BT/
-|       +-- BT.hs                Event loop, AVDTP driver, metrics reporter
-|       +-- AVDTP.hs             GADT state machine + SomeSession existential
-|       +-- AVRCP.hs             Command dispatch, metadata API
-|       +-- BlueZ.hs             D-Bus signal parsing (InterfacesAdded etc.)
-|       +-- DCF.hs               Control-plane DCF frames (metadata, volume)
-|       +-- FFI.hs               foreign import ccall unsafe bindings
-|       +-- Types.hs             Shared types (BTAddress, DeviceInfo, etc.)
+|   +-- src/DeMoD/BT/BT.hs        Event loop, AVDTP driver
+|   +-- src/DeMoD/BT/AVDTP.hs     GADT state machine + SomeSession wrapper
+|   +-- src/DeMoD/BT/AVRCP.hs     Command parsing + metadata helpers
+|   +-- src/DeMoD/BT/FFI.hs       FFI bindings and marshaling
 |
-+-- nixos/
-    +-- module.nix               NixOS service module (BlueZ + PipeWire + systemd)
++-- nixos/module.nix             NixOS service module
 ```
 
 ## License

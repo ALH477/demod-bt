@@ -1,9 +1,10 @@
--- | DeMoD.BT.AVRCP - Audio/Video Remote Control Profile (Production)
+-- | DeMoD.BT.AVRCP - Audio/Video Remote Control Profile Helpers
 --
--- Manages AVRCP metadata and playback control synchronization
--- through the Rust data plane's MediaPlayer1 D-Bus interface.
+-- Provides AVRCP command parsing and metadata helpers. The Rust
+-- MediaPlayer1 implementation is registered by the runtime; these
+-- helpers forward updates through the FFI.
 --
--- The Rust side serves the org.bluez.MediaPlayer1 interface on D-Bus.
+-- The Rust side includes an org.bluez.MediaPlayer1 implementation.
 -- This Haskell module provides the application-level API for:
 --   1. Updating track metadata (which Rust exports to car stereos)
 --   2. Processing playback commands (received from headset buttons)
@@ -20,14 +21,13 @@ module DeMoD.BT.AVRCP
 
     -- * Metadata
   , updateNowPlaying
-  , updatePlaybackStatus
   , clearNowPlaying
   ) where
 
 import Data.Text (Text)
 import qualified Data.Text as T
 import DeMoD.BT.Types
-import DeMoD.BT.FFI (setVolume, getVolume)
+import qualified DeMoD.BT.FFI as FFI
 
 -- ═══════════════════════════════════════════════════════════════════
 -- Command Types
@@ -53,9 +53,9 @@ data AVRCPCommand
   deriving stock (Show, Eq)
 
 -- | Parse an AVRCP command from the string tag sent by the Rust
--- event system. The Rust MediaPlayer1 handler sends "AVRCP:Play",
--- "AVRCP:Pause", etc. through the BlueZEvent::Error channel
--- (which is a pragmatic reuse of the event type for control messages).
+-- event system. When the Rust MediaPlayer1 handler is registered,
+-- it sends "AVRCP:Play", "AVRCP:Pause", etc. through the
+-- BlueZEvent::Error channel (a pragmatic reuse for control messages).
 parseCommand :: Text -> Maybe AVRCPCommand
 parseCommand t = case T.toLower (T.strip t) of
   "avrcp:play"         -> Just CmdPlay
@@ -86,17 +86,17 @@ handleCommand cmd = do
     CmdFastForward -> pure "Playback: FAST FORWARD"
     CmdRewind      -> pure "Playback: REWIND"
     CmdVolumeUp    -> do
-      vol <- getVolume
+      vol <- FFI.getVolume
       let newVol = min 127 (vol + 10)
-      setVolume newVol
+      FFI.setVolume newVol
       pure $ "Volume: " <> T.pack (show newVol) <> "/127"
     CmdVolumeDown  -> do
-      vol <- getVolume
+      vol <- FFI.getVolume
       let newVol = max 0 (vol - 10)
-      setVolume newVol
+      FFI.setVolume newVol
       pure $ "Volume: " <> T.pack (show newVol) <> "/127"
     CmdSetVolume v -> do
-      setVolume v
+      FFI.setVolume v
       pure $ "Volume: SET " <> T.pack (show v) <> "/127"
 
   putStrLn $ "  [AVRCP] " <> T.unpack action
@@ -108,28 +108,30 @@ handleCommand cmd = do
 
 -- | Update the "Now Playing" metadata on connected AVRCP 1.3+ sinks.
 --
--- The metadata is passed to the Rust runtime which exports it via
--- the org.bluez.MediaPlayer1.Track property on D-Bus. Car stereos
--- and headset displays read this property to show track information.
---
--- In the current architecture, metadata updates flow through the
--- Rust AVRCP module's PlaybackInfo shared state. The zbus framework
--- automatically emits PropertiesChanged signals when the Track
--- property is read, so car stereos get updates in real time.
+-- This forwards metadata into the Rust MediaPlayer1 state via FFI,
+-- which in turn exposes it to car stereos and headsets via D-Bus.
 updateNowPlaying :: TrackMetadata -> IO ()
 updateNowPlaying TrackMetadata{..} = do
   putStrLn $ "  [AVRCP] Now Playing: "
           <> T.unpack tmTitle <> " - "
           <> T.unpack tmArtist <> " ["
           <> T.unpack tmAlbum <> "]"
-  -- In production, this would call a Rust FFI function like:
-  --   demod_bt_update_metadata(title, artist, album, duration)
-  -- For now, the Rust MediaPlayer1 interface handles this directly
-  -- via the shared PlaybackInfo state.
+  _ <- FFI.updateMetadata (T.unpack tmTitle) (T.unpack tmArtist)
+                      (T.unpack tmAlbum) tmDuration
+  pure ()
 
 -- | Update the playback status on connected AVRCP sinks.
 updatePlaybackStatus :: PlaybackState -> IO ()
 updatePlaybackStatus PlaybackState{..} = do
+  let statusStr = case psStatus of
+        Playing     -> "playing"
+        Paused      -> "paused"
+        Stopped     -> "stopped"
+        FastForward -> "forward-seek"
+        Rewind      -> "reverse-seek"
+        Error       -> "error"
+  _ <- FFI.updatePlaybackStatus statusStr
+  _ <- FFI.updatePlaybackPosition psPosition
   putStrLn $ "  [AVRCP] Status: " <> show psStatus
           <> " @ " <> show psPosition <> "us"
 

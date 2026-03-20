@@ -1,14 +1,14 @@
-// codec.rs - Audio Codec Abstraction Layer (Production)
+// codec.rs - Audio Codec Abstraction Layer
 //
 // Wraps system codec libraries behind a unified Codec trait so the
 // engine can swap SBC for LC3 or AAC without code changes. The real
 // libsbc FFI bindings in sbc_ffi.rs do the actual encode/decode;
 // this module provides the typed interface the engine consumes.
 //
-// Production features:
+// Status notes:
 //   [1.4] Codec trait wired to real SbcContext FFI
-//   [1.5] SBC-XQ bitpool enforcement with configurable max
-//   [3.2] Frame-level PLC with exponential fade-out
+//   [1.5] Bitpool enforcement wired via BlueZ SelectConfiguration
+//   [3.2] PLC implemented in codec, invoked by engine on decode errors
 //
 // Frame sizes for DCF packetization (S7.4):
 //   SBC standard:  ~119 bytes (fits in 239-byte DCF payload)
@@ -43,6 +43,19 @@ impl fmt::Display for AudioCodec {
             Self::Mpeg12 => write!(f, "MPEG-1,2"),
             Self::Aac    => write!(f, "AAC"),
             Self::Lc3    => write!(f, "LC3"),
+        }
+    }
+}
+
+impl AudioCodec {
+    /// Map a BlueZ codec ID to our AudioCodec enum.
+    pub fn from_id(id: u8) -> Option<Self> {
+        match id {
+            0x00 => Some(Self::Sbc),
+            0x01 => Some(Self::Mpeg12),
+            0x02 => Some(Self::Aac),
+            0x06 => Some(Self::Lc3),
+            _ => None,
         }
     }
 }
@@ -474,18 +487,6 @@ impl Codec for Lc3CodecLive {
         self.ctx.as_ref().map(|c| c.frame_duration_us()).unwrap_or(10000)
     }
     fn codec_type(&self) -> AudioCodec { AudioCodec::Lc3 }
-}
-
-impl AudioCodec {
-    pub fn from_id(id: u8) -> Option<Self> {
-        match id {
-            0x00 => Some(Self::Sbc),
-            0x01 => Some(Self::Mpeg12),
-            0x02 => Some(Self::Aac),
-            0x06 => Some(Self::Lc3),
-            _ => None,
-        }
-    }
 }
 
 /// Simple hex encoding for logging (avoids pulling in the hex crate

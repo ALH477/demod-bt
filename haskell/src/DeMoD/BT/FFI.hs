@@ -22,7 +22,11 @@ module DeMoD.BT.FFI
 
     -- * Volume Control
   , setVolume
+  , setVolumeRemote
   , getVolume
+  , updateMetadata
+  , updatePlaybackStatus
+  , updatePlaybackPosition
 
     -- * Event Polling
   , EventType (..)
@@ -60,9 +64,11 @@ data EventType
   = EvtNone               -- ^ No event pending
   | EvtDeviceConnected    -- ^ A Bluetooth device connected
   | EvtDeviceDisconnected -- ^ A Bluetooth device disconnected
+  | EvtTransportPending   -- ^ Transport is pending and ready to acquire
   | EvtTransportAcquired  -- ^ BlueZ transport fd is ready
   | EvtTransportReleased  -- ^ BlueZ transport was released
   | EvtCodecNegotiated    -- ^ Codec config was agreed upon
+  | EvtVolumeChanged      -- ^ AVRCP absolute volume changed
   | EvtError              -- ^ An error occurred
   deriving stock (Show, Eq)
 
@@ -74,6 +80,8 @@ fromEventCode 2  = EvtDeviceDisconnected
 fromEventCode 3  = EvtTransportAcquired
 fromEventCode 4  = EvtTransportReleased
 fromEventCode 5  = EvtCodecNegotiated
+fromEventCode 6  = EvtTransportPending
+fromEventCode 7  = EvtVolumeChanged
 fromEventCode _  = EvtError
 
 -- ═══════════════════════════════════════════════════════════════════
@@ -167,8 +175,20 @@ foreign import ccall unsafe "demod_bt_is_streaming"
 foreign import ccall unsafe "demod_bt_set_volume"
   c_set_volume :: CUInt -> IO CInt
 
+foreign import ccall unsafe "demod_bt_set_volume_remote"
+  c_set_volume_remote :: CUInt -> IO CInt
+
 foreign import ccall unsafe "demod_bt_get_volume"
   c_get_volume :: IO CInt
+
+foreign import ccall unsafe "demod_bt_update_metadata"
+  c_update_metadata :: CString -> CString -> CString -> Word64 -> IO CInt
+
+foreign import ccall unsafe "demod_bt_update_playback_status"
+  c_update_playback_status :: CString -> IO CInt
+
+foreign import ccall unsafe "demod_bt_update_playback_position"
+  c_update_playback_position :: Word64 -> IO CInt
 
 foreign import ccall unsafe "demod_bt_shutdown"
   c_shutdown :: IO ()
@@ -248,17 +268,49 @@ isStreaming = do
   pure (result == 1)
 
 -- | [1.3] Set the audio output volume (0-127, AVRCP scale).
--- This propagates to the Rust engine's atomic volume, which the
--- CPAL audio callback reads on each buffer fill. No locks, no
--- allocation, no syscall -- just an atomic store.
+-- This updates local playback and propagates to BlueZ so the
+-- remote device stays in sync.
 setVolume :: Int -> IO ()
 setVolume vol = do
   _ <- c_set_volume (fromIntegral (max 0 (min 127 vol)))
   pure ()
 
+-- | Update volume from a remote AVRCP event without echoing to BlueZ.
+setVolumeRemote :: Int -> IO ()
+setVolumeRemote vol = do
+  _ <- c_set_volume_remote (fromIntegral (max 0 (min 127 vol)))
+  pure ()
+
 -- | [1.3] Get the current volume level (0-127).
 getVolume :: IO Int
 getVolume = fromIntegral <$> c_get_volume
+
+-- | Update AVRCP metadata exposed via Rust MediaPlayer1.
+updateMetadata
+  :: String   -- ^ Title
+  -> String   -- ^ Artist
+  -> String   -- ^ Album
+  -> Word64   -- ^ Duration (microseconds)
+  -> IO (Either String ())
+updateMetadata title artist album duration =
+  withCString title $ \ct ->
+  withCString artist $ \ca ->
+  withCString album $ \cal -> do
+    result <- c_update_metadata ct ca cal duration
+    pure $ if result == 0 then Right () else Left "demod_bt_update_metadata failed"
+
+-- | Update AVRCP playback status ("playing", "paused", "stopped").
+updatePlaybackStatus :: String -> IO (Either String ())
+updatePlaybackStatus status =
+  withCString status $ \cs -> do
+    result <- c_update_playback_status cs
+    pure $ if result == 0 then Right () else Left "demod_bt_update_playback_status failed"
+
+-- | Update AVRCP playback position (microseconds).
+updatePlaybackPosition :: Word64 -> IO (Either String ())
+updatePlaybackPosition pos = do
+  result <- c_update_playback_position pos
+  pure $ if result == 0 then Right () else Left "demod_bt_update_playback_position failed"
 
 -- | Shut down the Rust runtime completely. Call on exit.
 shutdownPipeline :: IO ()

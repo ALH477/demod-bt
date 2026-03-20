@@ -1,8 +1,9 @@
-// audio.rs - Audio Processing Utilities (Production)
+// audio.rs - Audio Processing Utilities
 //
-// [ROADMAP 3.1] Adaptive jitter buffer - IMPLEMENTED
-// [ROADMAP 3.4] Sample rate conversion - IMPLEMENTED
-// [ROADMAP 1.2] CPAL device change handling - IMPLEMENTED
+// Status: utilities implemented as library helpers (not in default engine path).
+// [ROADMAP 3.1] Adaptive jitter buffer - IMPLEMENTED (library only)
+// [ROADMAP 3.4] Sample rate conversion - IMPLEMENTED (library only)
+// [ROADMAP 1.2] CPAL device change handling - IMPLEMENTED (library only)
 //
 // LGPL-3.0 | Patent Pending | (c) 2025 DeMoD LLC
 

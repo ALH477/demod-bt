@@ -10,7 +10,7 @@
 //   [1.1] Graceful stream teardown (on_stream_ended callback)
 //   [1.3] Volume scaling in audio callback (atomic volume level)
 //   [1.4] Uses Codec trait, not raw SbcContext (codec-agnostic engine)
-//   [3.2] PLC on frame loss (via Codec::plc through the trait)
+//   [3.2] PLC implemented in codec (invoked on decode errors)
 //
 // Thread architecture (Sink mode):
 //
@@ -258,6 +258,7 @@ fn bt_reader_loop(
 
     let frame_len = codec.frame_length();
     let codesize = codec.codesize();
+    let samples_per_frame = (codesize / 2).max(1);
 
     tracing::info!(
         codec = %codec.codec_type(),
@@ -276,6 +277,26 @@ fn bt_reader_loop(
     let mut leftover = Vec::with_capacity(buf_size);
 
     let mut bt_file = unsafe { std::fs::File::from_raw_fd(bt_fd) };
+
+    let mut push_pcm = |samples_written: usize, pcm: &[i16]| {
+        if samples_written == 0 {
+            return;
+        }
+        if let Ok(mut chunk) = producer.write_chunk_uninit(samples_written) {
+            let (first, second) = chunk.as_mut_slices();
+            let first_len = first.len();
+            for (i, slot) in first.iter_mut().enumerate() {
+                slot.write(pcm[i]);
+            }
+            for (i, slot) in second.iter_mut().enumerate() {
+                slot.write(pcm[first_len + i]);
+            }
+            unsafe { chunk.commit_all() };
+        } else {
+            // Ring buffer full (overrun)
+            metrics.overruns.fetch_add(1, Ordering::Relaxed);
+        }
+    };
 
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -322,25 +343,13 @@ fn bt_reader_loop(
                     offset += consumed;
 
                     // Push decoded PCM into the ring buffer
-                    if samples_written > 0 {
-                        if let Ok(mut chunk) = producer.write_chunk_uninit(samples_written) {
-                            let (first, second) = chunk.as_mut_slices();
-                            let first_len = first.len();
-                            for (i, slot) in first.iter_mut().enumerate() {
-                                slot.write(pcm_buf[i]);
-                            }
-                            for (i, slot) in second.iter_mut().enumerate() {
-                                slot.write(pcm_buf[first_len + i]);
-                            }
-                            unsafe { chunk.commit_all() };
-                        } else {
-                            // Ring buffer full (overrun)
-                            metrics.overruns.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
+                    push_pcm(samples_written, &pcm_buf);
                 }
                 Err(e) => {
-                    tracing::debug!("Decode error at offset {}: {}, skipping byte", offset, e);
+                    tracing::debug!("Decode error at offset {}: {}, using PLC", offset, e);
+                    if let Ok(samples_written) = codec.plc(&mut pcm_buf[..samples_per_frame]) {
+                        push_pcm(samples_written, &pcm_buf);
+                    }
                     offset += 1; // skip one byte and try to resync
                 }
             }

@@ -1,4 +1,4 @@
-// avrcp.rs - Audio/Video Remote Control Profile (Production)
+// avrcp.rs - Audio/Video Remote Control Profile (MediaPlayer1)
 //
 // Implements the BlueZ MediaPlayer1 D-Bus interface to:
 //   1. Receive playback commands from headset buttons (CT role)
@@ -12,6 +12,7 @@
 //   - org.bluez.MediaControl1: BlueZ uses this to forward button
 //     presses from headsets. We watch for its signals.
 //
+// Status: MediaPlayer1 registration and metadata updates are wired.
 // [ROADMAP 2.1] Full AVRCP metadata chain - IMPLEMENTED
 //
 // LGPL-3.0 | Patent Pending | (c) 2025 DeMoD LLC
@@ -140,10 +141,16 @@ impl MediaPlayer {
 
     async fn fast_forward(&self) {
         tracing::info!("[AVRCP] Fast forward command received");
+        let _ = self.event_tx.send(BlueZEvent::Error {
+            message: "AVRCP:FastForward".into(),
+        });
     }
 
     async fn rewind(&self) {
         tracing::info!("[AVRCP] Rewind command received");
+        let _ = self.event_tx.send(BlueZEvent::Error {
+            message: "AVRCP:Rewind".into(),
+        });
     }
 
     // ── Properties (read by car stereos via AVRCP) ──────────────

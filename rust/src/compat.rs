@@ -1,7 +1,8 @@
 // compat.rs - BlueZ Compatibility and Workarounds
 //
-// [ROADMAP 2.3] BlueZ version-aware profile handling - IMPLEMENTED
-// [ROADMAP 2.4] SCMS-T DRM handling - IMPLEMENTED
+// Status: BlueZ version detection and SCMS-T capability wired into runtime.
+// [ROADMAP 2.3] BlueZ version-aware profile handling - PARTIALLY WIRED
+// [ROADMAP 2.4] SCMS-T DRM handling - WIRED (optional, with fallback)
 //
 // LGPL-3.0 | Patent Pending | (c) 2025 DeMoD LLC
 
@@ -21,7 +22,7 @@ impl std::fmt::Display for BlueZVersion {
 }
 
 /// Known BlueZ regressions and their workarounds.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct CompatInfo {
     pub version: Option<BlueZVersion>,
     /// BlueZ 5.83-5.84 fail to auto-connect A2DP on startup.
@@ -136,6 +137,7 @@ fn apply_version_workarounds(info: &mut CompatInfo, ver: BlueZVersion) {
 ///      WITH SCMS-T enabled (content_protection_type = 0x0002)
 ///   3. If SCMS-T is enabled, set the copy bit to "unrestricted" (0x00)
 ///      since we are not enforcing DRM
+#[derive(Debug, Clone, Copy)]
 pub struct ScmsTConfig {
     /// Whether to include SCMS-T capability in endpoint registration.
     pub enabled: bool,

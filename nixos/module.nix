@@ -51,6 +51,24 @@ in
       description = "Whether to make the adapter discoverable on startup.";
     };
 
+    adapter = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Optional BlueZ adapter path override (e.g., /org/bluez/hci1).
+        Leave null to auto-detect the first powered adapter.
+      '';
+    };
+
+    enableScmsT = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Advertise SCMS-T content protection in A2DP capabilities.
+        Useful for head units that refuse connections without it.
+      '';
+    };
+
     sampleRate = lib.mkOption {
       type = lib.types.int;
       default = 44100;
@@ -190,6 +208,10 @@ in
         DEMOD_BT_CHANNELS = toString cfg.channels;
         DEMOD_BT_JITTER_MS = toString cfg.jitterBufferMs;
         DEMOD_BT_DCF_PAYLOAD = toString cfg.dcfPayloadSize;
+      } // lib.optionalAttrs (cfg.adapter != null) {
+        DEMOD_BT_ADAPTER = cfg.adapter;
+      } // lib.optionalAttrs cfg.enableScmsT {
+        DEMOD_BT_ENABLE_SCMS_T = "1";
       };
 
       serviceConfig = {

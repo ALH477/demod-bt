@@ -53,10 +53,14 @@ data DcfHeader = DcfHeader
   } deriving stock (Show, Eq)
 
 -- | Message type constants (must match Rust MessageType repr).
-pattern MsgHeartbeat, MsgTrackMetadata, MsgVolumeChange :: Word8
-pattern MsgHeartbeat     = 0x01
+pattern MsgHeartbeat :: Word8
+pattern MsgHeartbeat = 0x01
+
+pattern MsgTrackMetadata :: Word8
 pattern MsgTrackMetadata = 0x30
-pattern MsgVolumeChange  = 0x21
+
+pattern MsgVolumeChange :: Word8
+pattern MsgVolumeChange = 0x21
 
 -- ═══════════════════════════════════════════════════════════════════
 -- Frame Construction

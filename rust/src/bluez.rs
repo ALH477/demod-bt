@@ -36,7 +36,8 @@ const SBC_SINK_CAPABILITIES: [u8; 4] = [
     53,   // Maximum bitpool (SBC High Quality)
 ];
 
-/// Maximum bitpool for SBC-XQ (higher quality, wider bandwidth)
+/// Maximum bitpool for SBC-XQ (higher quality, wider bandwidth).
+/// This is an upper bound; runtime may clamp lower based on BlueZ version.
 const SBC_XQ_MAX_BITPOOL: u8 = 76;
 
 /// Represents an active Bluetooth audio transport.
@@ -68,9 +69,11 @@ pub enum TransportState {
 pub enum BlueZEvent {
     DeviceConnected { address: String, name: String },
     DeviceDisconnected { address: String },
+    TransportPending { path: String },
     TransportAcquired { path: String, fd: i32, read_mtu: u16, write_mtu: u16 },
     TransportReleased { path: String },
     CodecNegotiated { codec: AudioCodec, config: Vec<u8> },
+    VolumeChanged { volume: u16 },
     Error { message: String },
 }
 
@@ -94,6 +97,8 @@ pub struct MediaEndpoint {
     transports: Arc<RwLock<HashMap<String, BluetoothTransport>>>,
     /// Whether we operate as sink (receive audio) or source (send audio)
     direction: StreamDirection,
+    /// Maximum SBC bitpool we are willing to negotiate
+    max_bitpool: u8,
 }
 
 /// Sink receives audio from a phone; Source sends audio to headphones
@@ -103,15 +108,31 @@ pub enum StreamDirection {
     Source,
 }
 
+fn endpoint_uuid(direction: StreamDirection) -> &'static str {
+    match direction {
+        StreamDirection::Sink => "0000110b-0000-1000-8000-00805f9b34fb",   // A2DP Sink
+        StreamDirection::Source => "0000110a-0000-1000-8000-00805f9b34fb", // A2DP Source
+    }
+}
+
+pub fn endpoint_path(direction: StreamDirection) -> &'static str {
+    match direction {
+        StreamDirection::Sink => "/org/demod/bt/sink/sbc",
+        StreamDirection::Source => "/org/demod/bt/source/sbc",
+    }
+}
+
 impl MediaEndpoint {
     pub fn new(
         event_tx: mpsc::UnboundedSender<BlueZEvent>,
         direction: StreamDirection,
+        max_bitpool: u8,
     ) -> Self {
         Self {
             event_tx,
             transports: Arc::new(RwLock::new(HashMap::new())),
             direction,
+            max_bitpool,
         }
     }
 }
@@ -158,7 +179,7 @@ impl MediaEndpoint {
 
         let cap0 = capabilities[0];
         let cap1 = capabilities[1];
-        let _min_bp = capabilities[2];
+        let min_bp = capabilities[2];
         let max_bp = capabilities[3];
 
         // Prefer 44.1kHz (CD quality), fall back to 48kHz, then lower
@@ -182,9 +203,12 @@ impl MediaEndpoint {
         let subbands = if cap1 & 0x08 != 0 { 0x08 } else { 0x04 };
         let alloc = if cap1 & 0x02 != 0 { 0x02 } else { 0x01 };
 
-        // Push bitpool as high as the remote allows (higher = better quality)
-        // Cap at SBC-XQ maximum for devices that support it
-        let bitpool = max_bp.min(SBC_XQ_MAX_BITPOOL);
+        // Push bitpool as high as the remote allows (higher = better quality).
+        // Cap at a runtime-chosen maximum (defaults to SBC-XQ upper bound).
+        let mut bitpool = max_bp.min(self.max_bitpool.min(SBC_XQ_MAX_BITPOOL));
+        if bitpool < min_bp {
+            bitpool = min_bp;
+        }
 
         let config = vec![
             freq | chan,
@@ -225,9 +249,15 @@ impl MediaEndpoint {
             .and_then(|v| <Vec<u8>>::try_from(v.clone()).ok())
             .unwrap_or_default();
 
+        let codec_id = properties
+            .get("Codec")
+            .and_then(|v| <u8>::try_from(v.clone()).ok())
+            .unwrap_or(AudioCodec::Sbc as u8);
+        let codec = AudioCodec::from_id(codec_id).unwrap_or(AudioCodec::Sbc);
+
         let bt_transport = BluetoothTransport {
             path: path.clone(),
-            codec: AudioCodec::Sbc, // TODO: detect from UUID
+            codec,
             configuration: config.clone(),
             state: TransportState::Pending,
         };
@@ -238,7 +268,7 @@ impl MediaEndpoint {
             .insert(path.clone(), bt_transport);
 
         let _ = self.event_tx.send(BlueZEvent::CodecNegotiated {
-            codec: AudioCodec::Sbc,
+            codec,
             config,
         });
 
@@ -327,24 +357,36 @@ trait MediaTransport1 {
 /// SelectConfiguration / SetConfiguration methods above.
 pub async fn register_endpoint(
     conn: &Connection,
+    adapter_path: &str,
     endpoint: MediaEndpoint,
     direction: StreamDirection,
+    content_protection: Option<Vec<u8>>,
 ) -> anyhow::Result<()> {
-    // Choose the right A2DP UUID based on direction
-    let uuid = match direction {
-        StreamDirection::Sink => "0000110b-0000-1000-8000-00805f9b34fb",   // A2DP Sink
-        StreamDirection::Source => "0000110a-0000-1000-8000-00805f9b34fb", // A2DP Source
-    };
-
-    let endpoint_path = match direction {
-        StreamDirection::Sink => "/org/demod/bt/sink/sbc",
-        StreamDirection::Source => "/org/demod/bt/source/sbc",
-    };
+    let endpoint_path = endpoint_path(direction);
 
     // Serve our MediaEndpoint1 interface on the bus
     conn.object_server()
         .at(endpoint_path, endpoint)
         .await?;
+
+    register_endpoint_on_adapter(conn, adapter_path, endpoint_path, direction, content_protection)
+        .await?;
+
+    Ok(())
+}
+
+/// Register an already-served endpoint path with BlueZ Media1.
+///
+/// This can be used to retry registration with different properties
+/// (e.g., enabling SCMS-T) without re-registering the D-Bus object.
+pub async fn register_endpoint_on_adapter(
+    conn: &Connection,
+    adapter_path: &str,
+    endpoint_path: &str,
+    direction: StreamDirection,
+    content_protection: Option<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let uuid = endpoint_uuid(direction);
 
     // Build the registration properties dict
     let mut props: HashMap<&str, Value<'_>> = HashMap::new();
@@ -354,9 +396,16 @@ pub async fn register_endpoint(
         "Capabilities",
         Value::from(SBC_SINK_CAPABILITIES.to_vec()),
     );
+    if let Some(cp) = content_protection {
+        // BlueZ expects "ContentProtection" as a byte array (A2DP SCMS-T).
+        props.insert("ContentProtection", Value::from(cp));
+    }
 
     // Call org.bluez.Media1.RegisterEndpoint on the adapter
-    let media = Media1Proxy::new(conn).await?;
+    let media = Media1Proxy::builder(conn)
+        .path(adapter_path)?
+        .build()
+        .await?;
     media
         .register_endpoint(
             zvariant::ObjectPath::try_from(endpoint_path)?,
@@ -405,6 +454,20 @@ pub async fn acquire_transport(
     });
 
     Ok((raw_fd, read_mtu, write_mtu))
+}
+
+/// Set the transport volume (AVRCP absolute volume, 0-127).
+pub async fn set_transport_volume(
+    conn: &Connection,
+    transport_path: &str,
+    volume: u16,
+) -> anyhow::Result<()> {
+    let proxy = MediaTransport1Proxy::builder(conn)
+        .path(transport_path)?
+        .build()
+        .await?;
+    proxy.set_volume(volume).await?;
+    Ok(())
 }
 
 // Re-export for use in ffi

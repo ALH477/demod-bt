@@ -35,6 +35,8 @@ typedef struct {
 #define DEMOD_BT_EVT_TRANSPORT_ACQUIRED  3
 #define DEMOD_BT_EVT_TRANSPORT_RELEASED  4
 #define DEMOD_BT_EVT_CODEC_NEGOTIATED    5
+#define DEMOD_BT_EVT_TRANSPORT_PENDING   6
+#define DEMOD_BT_EVT_VOLUME_CHANGED      7
 #define DEMOD_BT_EVT_ERROR              -1
 
 typedef struct {
@@ -57,7 +59,14 @@ int  demod_bt_start_stream(int bt_fd, const uint8_t *codec_config,
 void demod_bt_stop_stream(void);
 int  demod_bt_is_streaming(void);
 int  demod_bt_set_volume(unsigned volume);   /* 0-127, AVRCP scale */
+int  demod_bt_set_volume_remote(unsigned volume); /* from remote AVRCP */
 int  demod_bt_get_volume(void);              /* returns 0-127 */
+int  demod_bt_update_metadata(const char *title,
+                              const char *artist,
+                              const char *album,
+                              uint64_t duration_us);
+int  demod_bt_update_playback_status(const char *status);
+int  demod_bt_update_playback_position(uint64_t position_us);
 void demod_bt_shutdown(void);
 
 /* ── Event Polling ────────────────────────────────────────────── */

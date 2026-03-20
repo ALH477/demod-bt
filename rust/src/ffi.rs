@@ -194,9 +194,9 @@ pub extern "C" fn demod_bt_is_streaming() -> c_int {
     })
 }
 
-/// [1.3] Set the audio output volume. AVRCP scale: 0 (mute) to 127 (max).
-/// Called by Haskell when a VolumeChanged event is received, or when
-/// the user adjusts volume through the application UI.
+/// [1.3] Set the audio output volume locally and propagate to BlueZ.
+/// AVRCP scale: 0 (mute) to 127 (max).
+/// Called when the local app/UI adjusts volume (outbound).
 /// Returns 0 on success, -1 if not streaming.
 #[no_mangle]
 pub extern "C" fn demod_bt_set_volume(volume: c_uint) -> c_int {
@@ -206,11 +206,65 @@ pub extern "C" fn demod_bt_set_volume(volume: c_uint) -> c_int {
     })
 }
 
+/// Update the local volume from a remote AVRCP VolumeChanged event.
+/// Does NOT call back into BlueZ (avoids feedback loops).
+#[no_mangle]
+pub extern "C" fn demod_bt_set_volume_remote(volume: c_uint) -> c_int {
+    with_runtime!(|rt: &mut Box<Runtime>| {
+        rt.set_volume_remote(volume as u16);
+        0
+    })
+}
+
 /// Get the current volume level (0-127).
 #[no_mangle]
 pub extern "C" fn demod_bt_get_volume() -> c_int {
     with_runtime!(|rt: &mut Box<Runtime>| {
         rt.get_volume() as c_int
+    })
+}
+
+/// Update AVRCP metadata (title/artist/album/duration) for MediaPlayer1.
+/// Returns 0 on success, -1 if not initialized or MediaPlayer not ready.
+#[no_mangle]
+pub extern "C" fn demod_bt_update_metadata(
+    title: *const c_char,
+    artist: *const c_char,
+    album: *const c_char,
+    duration_us: u64,
+) -> c_int {
+    let title = if title.is_null() { "" } else { unsafe { CStr::from_ptr(title) }.to_str().unwrap_or("") };
+    let artist = if artist.is_null() { "" } else { unsafe { CStr::from_ptr(artist) }.to_str().unwrap_or("") };
+    let album = if album.is_null() { "" } else { unsafe { CStr::from_ptr(album) }.to_str().unwrap_or("") };
+
+    with_runtime!(|rt: &mut Box<Runtime>| {
+        match rt.update_metadata(title, artist, album, duration_us) {
+            Ok(()) => 0,
+            Err(_) => -1,
+        }
+    })
+}
+
+/// Update AVRCP playback status string ("playing", "paused", "stopped").
+#[no_mangle]
+pub extern "C" fn demod_bt_update_playback_status(status: *const c_char) -> c_int {
+    let status = if status.is_null() { "" } else { unsafe { CStr::from_ptr(status) }.to_str().unwrap_or("") };
+    with_runtime!(|rt: &mut Box<Runtime>| {
+        match rt.update_status(status) {
+            Ok(()) => 0,
+            Err(_) => -1,
+        }
+    })
+}
+
+/// Update AVRCP playback position in microseconds.
+#[no_mangle]
+pub extern "C" fn demod_bt_update_playback_position(position_us: u64) -> c_int {
+    with_runtime!(|rt: &mut Box<Runtime>| {
+        match rt.update_position(position_us) {
+            Ok(()) => 0,
+            Err(_) => -1,
+        }
     })
 }
 
@@ -236,6 +290,8 @@ pub const EVT_DEVICE_DISCONNECTED: c_int = 2;
 pub const EVT_TRANSPORT_ACQUIRED: c_int = 3;
 pub const EVT_TRANSPORT_RELEASED: c_int = 4;
 pub const EVT_CODEC_NEGOTIATED: c_int = 5;
+pub const EVT_TRANSPORT_PENDING: c_int = 6;
+pub const EVT_VOLUME_CHANGED: c_int = 7;
 pub const EVT_ERROR: c_int = -1;
 
 /// Opaque event data returned by polling.
@@ -305,6 +361,13 @@ pub extern "C" fn demod_bt_poll_event(out: *mut FfiEvent) -> c_int {
                                 .unwrap_or(ptr::null_mut());
                             EVT_TRANSPORT_ACQUIRED
                         }
+                        BlueZEvent::TransportPending { path } => {
+                            (*out).event_type = EVT_TRANSPORT_PENDING;
+                            (*out).string_data = CString::new(path)
+                                .map(|s| s.into_raw())
+                                .unwrap_or(ptr::null_mut());
+                            EVT_TRANSPORT_PENDING
+                        }
                         BlueZEvent::TransportReleased { path } => {
                             (*out).event_type = EVT_TRANSPORT_RELEASED;
                             (*out).string_data = CString::new(path)
@@ -318,6 +381,13 @@ pub extern "C" fn demod_bt_poll_event(out: *mut FfiEvent) -> c_int {
                                 .map(|s| s.into_raw())
                                 .unwrap_or(ptr::null_mut());
                             EVT_CODEC_NEGOTIATED
+                        }
+                        BlueZEvent::VolumeChanged { volume } => {
+                            (*out).event_type = EVT_VOLUME_CHANGED;
+                            (*out).string_data = CString::new(format!("{}", volume))
+                                .map(|s| s.into_raw())
+                                .unwrap_or(ptr::null_mut());
+                            EVT_VOLUME_CHANGED
                         }
                         BlueZEvent::Error { message } => {
                             (*out).event_type = EVT_ERROR;

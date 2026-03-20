@@ -1,14 +1,17 @@
--- | DeMoD.BT.BlueZ - BlueZ D-Bus Orchestration (Production)
+-- | DeMoD.BT.BlueZ - BlueZ D-Bus Orchestration Helpers
 --
--- Manages the D-Bus connection to BlueZ's bluetoothd daemon.
--- Provides proper parsing of BlueZ signal bodies:
+-- Optional Haskell-side helpers for BlueZ D-Bus interaction.
+-- These are not currently used by the daemon (the Rust runtime
+-- owns D-Bus and event polling), but kept for future integration.
+--
+-- Provides parsing of BlueZ signal bodies:
 --   - InterfacesAdded:   new device discovered or connected
 --   - InterfacesRemoved: device disappeared
 --   - PropertiesChanged: connection state, metadata, volume changes
 --
--- Production features:
---   [2.5] Proper BlueZ signal parsing (not placeholder stubs)
---   [0.3] Adapter path awareness (not hardcoded hci0)
+-- Status notes:
+--   Optional helpers for future Haskell-side BlueZ integration.
+--   The production daemon uses the Rust D-Bus runtime today.
 --
 -- LGPL-3.0 | Patent Pending | (c) 2025 DeMoD LLC
 module DeMoD.BT.BlueZ
@@ -33,7 +36,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Maybe (fromMaybe)
 import Data.Word (Word32)
 import Control.Concurrent.STM (TBQueue, atomically, writeTBQueue)
 import Control.Exception (try, SomeException)
@@ -93,7 +96,7 @@ findAdapter client = do
 -- | Try to extract an adapter path from the ObjectManager response.
 -- The structure is deeply nested variants; we peel them carefully.
 extractAdapterPath :: Variant -> Maybe ObjectPath
-extractAdapterPath v = do
+extractAdapterPath _v = do
   -- The outermost type is a{oa{sa{sv}}}
   -- We can't easily parse this with the dbus library's generic fromVariant,
   -- so we use a pragmatic approach: convert to string representation
@@ -298,7 +301,6 @@ watchDevices BlueZConn{..} queue = do
     })
     (\sig -> do
       let body = signalBody sig
-          path = signalPath sig
       case body of
         -- Body: [String (interface), Dict{String, Variant}, [String]]
         (ifaceVar : changedVar : _) -> do

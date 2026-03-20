@@ -7,6 +7,10 @@ Created by Asher - DeMoD LLC
 
 ---
 
+> Status note (2026-03-20): This roadmap captures the original plan. Many
+> items are now implemented and wired; see `README.md` for current behavior
+> and remaining optional/experimental pieces.
+
 ## Phase 0: Critical Path (must work for any audio to flow)
 
 These items block the first successful end-to-end test. Nothing else

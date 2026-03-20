@@ -15,9 +15,12 @@ module DeMoD.BT
 
 import Control.Concurrent (threadDelay)
 import Control.Monad (forever, when)
+import Data.Char (toLower)
 import Data.IORef
 import qualified Data.Text as T
+import Text.Read (readMaybe)
 import System.IO (hFlush, stdout)
+import System.Environment (lookupEnv)
 
 import DeMoD.BT.Types
 import DeMoD.BT.AVDTP
@@ -27,14 +30,21 @@ import DeMoD.BT.DCF
 import DeMoD.BT.FFI
 
 startDaemon :: StreamDirection -> IO ()
-startDaemon dir = do
+startDaemon dirArg = do
+  dir <- readDirection dirArg
+  sampleRate <- readEnvInt "DEMOD_BT_SAMPLE_RATE" 44100
+  channels <- readEnvInt "DEMOD_BT_CHANNELS" 2
+  jitterMs <- readEnvInt "DEMOD_BT_JITTER_MS" 40
+  dcfPayload <- readEnvInt "DEMOD_BT_DCF_PAYLOAD" (fromIntegral dcfOptimalPayload)
+
   putStrLn $ "  Version:     " <> getVersion
   putStrLn $ "  Direction:   " <> show dir
   putStrLn $ "  DCF:         " <> show dcfHeaderSize <> "B header + "
                                <> show dcfOptimalPayload <> "B payload = 256B"
   putStrLn ""
 
-  result <- initPipeline 44100 2 dir 40 dcfOptimalPayload
+  result <- initPipeline (fromIntegral sampleRate) (fromIntegral channels)
+                        dir (fromIntegral jitterMs) (fromIntegral dcfPayload)
   case result of
     Left err -> putStrLn $ "  FATAL: " <> err
     Right () -> do
@@ -51,7 +61,22 @@ startDaemon dir = do
           counterRef <- newIORef (0 :: Int)
           eventLoop sessionRef counterRef
           shutdownPipeline
-          putStrLn "\n  Shut down."
+  putStrLn "\n  Shut down."
+
+readEnvInt :: String -> Int -> IO Int
+readEnvInt key def = do
+  v <- lookupEnv key
+  pure $ case v >>= readMaybe of
+    Just n  -> n
+    Nothing -> def
+
+readDirection :: StreamDirection -> IO StreamDirection
+readDirection def = do
+  v <- lookupEnv "DEMOD_BT_DIRECTION"
+  pure $ case fmap (map toLower) v of
+    Just "sink"   -> Sink
+    Just "source" -> Source
+    _             -> def
 
 eventLoop :: IORef SomeSession -> IORef Int -> IO ()
 eventLoop sessionRef counterRef = forever $ do
@@ -72,7 +97,11 @@ handleEvent :: IORef SomeSession -> FfiEvent -> IO ()
 handleEvent sessionRef FfiEvent{..} = case feEventType of
 
   EvtDeviceConnected ->
-    putStrLn $ "  [+] Device: " <> maybe "?" id feStringData
+    case feStringData of
+      Nothing -> putStrLn "  [+] Device connected"
+      Just s  -> case break (=='|') s of
+        (addr, '|':name) -> putStrLn $ "  [+] Device: " <> addr <> " (" <> name <> ")"
+        _ -> putStrLn $ "  [+] Device: " <> s
 
   EvtDeviceDisconnected -> do
     putStrLn $ "  [-] Disconnected: " <> maybe "?" id feStringData
@@ -84,21 +113,28 @@ handleEvent sessionRef FfiEvent{..} = case feEventType of
       Just io -> io
       Nothing -> ss
 
+  EvtTransportPending -> do
+    let path = maybe "" id feStringData
+    streaming <- isStreaming
+    if streaming
+      then pure ()
+      else do
+        putStrLn $ "  [>] Transport pending: " <> path
+        result <- acquireAndStart path
+        case result of
+          Right () -> pure ()
+          Left err -> putStrLn $ "  [!] Acquire failed: " <> err
+
   EvtTransportAcquired -> do
     let path = maybe "" id feStringData
-    putStrLn $ "  [>] Transport: " <> path
-    result <- acquireAndStart path
-    case result of
-      Right () -> do
-        vol <- getVolume
-        putStrLn $ "  [>] STREAMING (vol " <> show vol <> "/127)"
-        -- Drive AVDTP: Idle -> Configured -> Open -> Streaming
-        ss <- readIORef sessionRef
-        ss1 <- driveEvent ss (EvCodecConfigured CodecSBC mempty (T.pack path))
-        ss2 <- driveEvent ss1 (EvTransportOpened (T.pack path))
-        ss3 <- driveEvent ss2 EvStreamStarted
-        writeIORef sessionRef ss3
-      Left err -> putStrLn $ "  [!] Start failed: " <> err
+    putStrLn $ "  [>] Transport acquired: " <> path
+    vol <- getVolume
+    putStrLn $ "  [>] STREAMING (vol " <> show vol <> "/127)"
+    -- Drive AVDTP: Configured -> Open -> Streaming
+    ss <- readIORef sessionRef
+    ss1 <- driveEvent ss (EvTransportOpened (T.pack path))
+    ss2 <- driveEvent ss1 EvStreamStarted
+    writeIORef sessionRef ss2
 
   EvtTransportReleased -> do
     putStrLn $ "  [x] Released: " <> maybe "" id feStringData
@@ -108,11 +144,23 @@ handleEvent sessionRef FfiEvent{..} = case feEventType of
     writeIORef sessionRef ss'
 
   EvtCodecNegotiated -> do
-    let codec = maybe "?" id feStringData
-    putStrLn $ "  [C] Codec: " <> codec
+    let codecStr = maybe "?" id feStringData
+        codec = case map toLower codecStr of
+          "sbc"  -> CodecSBC
+          "aac"  -> CodecAAC
+          "lc3"  -> CodecLC3
+          _      -> CodecSBC
+    putStrLn $ "  [C] Codec: " <> codecStr
     ss <- readIORef sessionRef
-    ss' <- driveEvent ss (EvCodecConfigured CodecSBC mempty (T.pack codec))
+    ss' <- driveEvent ss (EvCodecConfigured codec mempty (T.pack codecStr))
     writeIORef sessionRef ss'
+
+  EvtVolumeChanged -> do
+    case feStringData >>= readMaybe of
+      Nothing -> pure ()
+      Just vol -> do
+        setVolumeRemote vol
+        putStrLn $ "  [V] Volume: " <> show vol <> "/127"
 
   EvtError -> do
     let msg = maybe "" id feStringData

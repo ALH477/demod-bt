@@ -2,7 +2,7 @@ cabal-version: 3.0
 name:          demod-bt
 version:       0.1.0.0
 license:       LGPL-3.0-or-later
-license-file:  ../LICENSE
+license-file:  LICENSE
 author:        Asher <info@demod.ltd>
 maintainer:    info@demod.ltd
 copyright:     (c) 2025 DeMoD LLC
@@ -31,6 +31,7 @@ common shared
     DeriveAnyClass
     LambdaCase
     RecordWildCards
+    PatternSynonyms
   ghc-options:
     -Wall
     -Wincomplete-patterns

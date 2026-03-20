@@ -9,14 +9,14 @@
 //   [0.2] Transport state monitoring (PropertiesChanged watcher)
 //   [0.3] Adapter enumeration (ObjectManager discovery)
 //   [1.1] Graceful stream teardown (StreamEnded events)
-//   [1.3] Volume synchronization (transport Volume property)
+//   [1.3] Volume control (local/remote sync + transport watcher)
 //
 // LGPL-3.0 | Patent Pending | (c) 2025 DeMoD LLC
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use zbus::Connection;
 use zbus::fdo::ObjectManagerProxy;
 use zvariant::OwnedValue;
@@ -24,6 +24,8 @@ use zvariant::OwnedValue;
 use crate::bluez::{
     self, BlueZEvent, MediaEndpoint, StreamDirection as BzDirection,
 };
+use crate::compat::{self, ScmsTConfig};
+use crate::avrcp::{self, PlaybackInfo};
 use crate::engine::{self, EngineHandle};
 use crate::transport::{AudioConfig, AudioPipeline, StreamDirection, StreamMetrics};
 
@@ -54,6 +56,16 @@ pub struct Runtime {
     active_transport: Option<String>,
     /// Discovered adapter path (from enumeration)
     adapter_path: String,
+    /// Optional adapter override from environment
+    adapter_override: Option<String>,
+    /// Maximum safe SBC bitpool (from BlueZ compat detection)
+    max_bitpool: u8,
+    /// SCMS-T configuration (optional)
+    scms_t: ScmsTConfig,
+    /// AVRCP playback metadata handle (MediaPlayer1)
+    playback_info: Option<Arc<RwLock<PlaybackInfo>>>,
+    /// Last volume value we applied locally or sent to BlueZ
+    last_volume_sent: u16,
     /// Shared metrics (same Arc across all stream generations)
     pub metrics: Arc<StreamMetrics>,
 }
@@ -73,6 +85,15 @@ impl Runtime {
         let metrics = pipeline.metrics();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
+        let adapter_override = std::env::var("DEMOD_BT_ADAPTER")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let scms_t = if env_flag("DEMOD_BT_ENABLE_SCMS_T") {
+            ScmsTConfig::with_scmst()
+        } else {
+            ScmsTConfig::default()
+        };
+
         Ok(Self {
             tokio_rt,
             dbus_conn: None,
@@ -83,6 +104,11 @@ impl Runtime {
             last_codec_config: Vec::new(),
             active_transport: None,
             adapter_path: "/org/bluez/hci0".to_string(), // default, overridden by enumeration
+            adapter_override,
+            max_bitpool: 53,
+            scms_t,
+            playback_info: None,
+            last_volume_sent: 127,
             metrics,
         })
     }
@@ -96,7 +122,11 @@ impl Runtime {
     /// object path. Falls back to /org/bluez/hci0 if enumeration fails.
     ///
     /// [ROADMAP 0.3] Adapter enumeration - IMPLEMENTED
-    async fn enumerate_adapter(conn: &Connection) -> String {
+    async fn enumerate_adapter(conn: &Connection, override_path: Option<String>) -> String {
+        if let Some(path) = override_path {
+            tracing::info!(adapter = %path, "Using adapter override from environment");
+            return path;
+        }
         let proxy = match ObjectManagerProxy::builder(conn)
             .destination("org.bluez")
             .ok()
@@ -159,8 +189,12 @@ impl Runtime {
     pub fn register(&mut self) -> Result<(), RuntimeError> {
         let direction = self.pipeline.config.direction;
         let event_tx = self.event_tx.clone();
+        let compat_info = compat::detect_bluez_version();
+        let max_bitpool = compat_info.max_safe_bitpool;
+        let adapter_override = self.adapter_override.clone();
+        let mut scms_t = self.scms_t;
 
-        let (conn, adapter_path) = self.tokio_rt.block_on(async {
+        let (conn, adapter_path, info_handle, scms_t_used) = self.tokio_rt.block_on(async {
             // Connect to the system D-Bus
             let conn = Connection::system()
                 .await
@@ -169,28 +203,70 @@ impl Runtime {
             tracing::info!("Connected to system D-Bus");
 
             // [0.3] Enumerate adapters to find the right one
-            let adapter_path = Self::enumerate_adapter(&conn).await;
+            let adapter_path = Self::enumerate_adapter(&conn, adapter_override).await;
 
             // Create and register our media endpoint
             let bz_dir = match direction {
                 StreamDirection::Sink => BzDirection::Sink,
                 StreamDirection::Source => BzDirection::Source,
             };
-            let endpoint = MediaEndpoint::new(event_tx, bz_dir);
+            let endpoint = MediaEndpoint::new(event_tx.clone(), bz_dir, max_bitpool);
+            let content_protection = scms_t.capability_bytes();
+            let register_result = bluez::register_endpoint(
+                &conn,
+                &adapter_path,
+                endpoint,
+                bz_dir,
+                content_protection.clone(),
+            ).await;
 
-            bluez::register_endpoint(&conn, endpoint, bz_dir)
+            if let Err(e) = register_result {
+                let msg = e.to_string();
+                let msg_lc = msg.to_ascii_lowercase();
+                let needs_scmst = content_protection.is_none()
+                    && ((msg_lc.contains("content") && msg_lc.contains("protection"))
+                        || msg_lc.contains("scms"));
+                if needs_scmst {
+                    tracing::warn!(
+                        "Endpoint registration failed without SCMS-T ({}); retrying with SCMS-T",
+                        msg
+                    );
+                    scms_t = ScmsTConfig::with_scmst();
+                    let cp = scms_t.capability_bytes();
+                    bluez::register_endpoint_on_adapter(
+                        &conn,
+                        &adapter_path,
+                        bluez::endpoint_path(bz_dir),
+                        bz_dir,
+                        cp,
+                    )
+                    .await
+                    .map_err(|e| RuntimeError::EndpointRegister(e.to_string()))?;
+                } else {
+                    return Err(RuntimeError::EndpointRegister(msg));
+                }
+            }
+
+            // Register AVRCP MediaPlayer1 (metadata + transport commands)
+            let player = avrcp::MediaPlayer::new(event_tx.clone());
+            let info_handle = avrcp::register_media_player(&conn, player)
                 .await
-                .map_err(|e| RuntimeError::EndpointRegister(e.to_string()))?;
+                .map_err(|e| RuntimeError::AvrcpRegister(e.to_string()))?;
 
-            // [0.2] Start watching for transport property changes
-            // This catches State transitions and Volume changes
-            Self::start_transport_watcher(&conn).await;
+            // [0.2] Start watching for BlueZ property changes
+            // This catches transport state transitions, volume, and device connect events.
+            Self::start_bluez_watcher(&conn, event_tx.clone()).await;
 
-            Ok::<(Connection, String), RuntimeError>((conn, adapter_path))
+            Ok::<(Connection, String, Arc<RwLock<PlaybackInfo>>, ScmsTConfig), RuntimeError>(
+                (conn, adapter_path, info_handle, scms_t)
+            )
         })?;
 
         self.dbus_conn = Some(conn);
         self.adapter_path = adapter_path;
+        self.playback_info = Some(info_handle);
+        self.scms_t = scms_t_used;
+        self.max_bitpool = max_bitpool;
 
         tracing::info!(
             adapter = %self.adapter_path,
@@ -211,7 +287,10 @@ impl Runtime {
     ///
     /// [ROADMAP 0.2] Transport state monitoring - IMPLEMENTED
     /// [ROADMAP 1.3] Volume synchronization - IMPLEMENTED
-    async fn start_transport_watcher(conn: &Connection) {
+    async fn start_bluez_watcher(
+        conn: &Connection,
+        event_tx: mpsc::UnboundedSender<BlueZEvent>,
+    ) {
         let conn_clone = conn.clone();
 
         tokio::spawn(async move {
@@ -285,12 +364,44 @@ impl Runtime {
                                     state = %state,
                                     "Transport state changed"
                                 );
+                                if state == "pending" {
+                                    let _ = event_tx.send(BlueZEvent::TransportPending {
+                                        path: path_str.clone(),
+                                    });
+                                }
                             }
                         }
 
                         if let Some(vol_val) = changed.get("Volume") {
                             if let Ok(volume) = <u16>::try_from(vol_val.clone()) {
                                 tracing::info!(volume = volume, "AVRCP volume changed");
+                                let _ = event_tx.send(BlueZEvent::VolumeChanged { volume });
+                            }
+                        }
+                    } else if target_iface == "org.bluez.Device1" {
+                        if let Some(conn_val) = changed.get("Connected") {
+                            if let Ok(connected) = <bool>::try_from(conn_val.clone()) {
+                                let path_str = msg.header().path()
+                                    .map(|p| p.to_string())
+                                    .unwrap_or_else(|| "?".to_string());
+                                let address = changed.get("Address")
+                                    .and_then(|v| <String>::try_from(v.clone()).ok())
+                                    .or_else(|| parse_address_from_path(&path_str))
+                                    .unwrap_or_else(|| "?".to_string());
+                                let name = changed.get("Name")
+                                    .and_then(|v| <String>::try_from(v.clone()).ok())
+                                    .unwrap_or_else(|| "Unknown".to_string());
+
+                                if connected {
+                                    let _ = event_tx.send(BlueZEvent::DeviceConnected {
+                                        address,
+                                        name,
+                                    });
+                                } else {
+                                    let _ = event_tx.send(BlueZEvent::DeviceDisconnected {
+                                        address,
+                                    });
+                                }
                             }
                         }
                     }
@@ -318,7 +429,13 @@ impl Runtime {
             }
         }
 
-        self.event_rx.try_recv().ok()
+        if let Ok(event) = self.event_rx.try_recv() {
+            if let BlueZEvent::CodecNegotiated { codec: _, config } = &event {
+                self.last_codec_config = config.clone();
+            }
+            return Some(event);
+        }
+        None
     }
 
     // ── Stream Management ───────────────────────────────────────
@@ -364,6 +481,7 @@ impl Runtime {
         }
         .map_err(|e| RuntimeError::EngineStart(e.to_string()))?;
 
+        handle.set_volume(self.last_volume_sent);
         self.last_codec_config = codec_config.to_vec();
         self.engine = Some(handle);
 
@@ -441,16 +559,46 @@ impl Runtime {
     /// Propagates to the engine's atomic volume, which the CPAL
     /// audio callback reads on each buffer fill.
     pub fn set_volume(&mut self, volume: u16) {
+        let volume = volume.min(127);
+        if volume == self.last_volume_sent {
+            if let Some(ref engine) = self.engine {
+                engine.set_volume(volume);
+            }
+            return;
+        }
+
         if let Some(ref engine) = self.engine {
             engine.set_volume(volume);
         }
+        self.last_volume_sent = volume;
+
+        // Propagate to BlueZ transport (AVRCP absolute volume)
+        if let (Some(conn), Some(path)) = (self.dbus_conn.as_ref(), self.active_transport.as_ref()) {
+            let conn = conn.clone();
+            let path = path.clone();
+            self.tokio_rt.block_on(async {
+                if let Err(e) = bluez::set_transport_volume(&conn, &path, volume).await {
+                    tracing::warn!("Failed to set BlueZ transport volume: {}", e);
+                }
+            });
+        }
+    }
+
+    /// Update volume from a remote AVRCP VolumeChanged event.
+    /// This updates local playback without sending a new D-Bus SetVolume.
+    pub fn set_volume_remote(&mut self, volume: u16) {
+        let volume = volume.min(127);
+        if let Some(ref engine) = self.engine {
+            engine.set_volume(volume);
+        }
+        self.last_volume_sent = volume;
     }
 
     /// [1.3] Get the current volume level.
     pub fn get_volume(&self) -> u16 {
         self.engine.as_ref()
             .map(|e| e.volume.load(Ordering::Relaxed))
-            .unwrap_or(127)
+            .unwrap_or(self.last_volume_sent)
     }
 
     /// Shut down everything: engine, D-Bus watchers, tokio runtime.
@@ -459,6 +607,41 @@ impl Runtime {
         drop(self.dbus_conn.take());
         self.tokio_rt.shutdown_background();
         tracing::info!("Runtime shut down");
+    }
+
+    // ── AVRCP metadata updates ─────────────────────────────────
+
+    pub fn update_metadata(
+        &self,
+        title: &str,
+        artist: &str,
+        album: &str,
+        duration_us: u64,
+    ) -> Result<(), RuntimeError> {
+        let info = self.playback_info.as_ref()
+            .ok_or(RuntimeError::AvrcpNotReady)?;
+        self.tokio_rt.block_on(async {
+            avrcp::update_metadata(info, title, artist, album, duration_us).await;
+        });
+        Ok(())
+    }
+
+    pub fn update_status(&self, status: &str) -> Result<(), RuntimeError> {
+        let info = self.playback_info.as_ref()
+            .ok_or(RuntimeError::AvrcpNotReady)?;
+        self.tokio_rt.block_on(async {
+            avrcp::update_status(info, status).await;
+        });
+        Ok(())
+    }
+
+    pub fn update_position(&self, position_us: u64) -> Result<(), RuntimeError> {
+        let info = self.playback_info.as_ref()
+            .ok_or(RuntimeError::AvrcpNotReady)?;
+        self.tokio_rt.block_on(async {
+            avrcp::update_position(info, position_us).await;
+        });
+        Ok(())
     }
 }
 
@@ -474,6 +657,10 @@ pub enum RuntimeError {
     DBusConnect(String),
     #[error("Endpoint registration failed: {0}")]
     EndpointRegister(String),
+    #[error("AVRCP registration failed: {0}")]
+    AvrcpRegister(String),
+    #[error("AVRCP not ready (MediaPlayer1 not registered)")]
+    AvrcpNotReady,
     #[error("Not connected to D-Bus")]
     NotConnected,
     #[error("Transport acquisition failed: {0}")]
@@ -482,4 +669,22 @@ pub enum RuntimeError {
     TransportNotReady(String),
     #[error("Engine start failed: {0}")]
     EngineStart(String),
+}
+
+fn env_flag(key: &str) -> bool {
+    match std::env::var(key) {
+        Ok(v) => {
+            let v = v.to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        }
+        Err(_) => false,
+    }
+}
+
+fn parse_address_from_path(path: &str) -> Option<String> {
+    // Example: /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF
+    let idx = path.find("dev_")?;
+    let addr = &path[idx + 4..];
+    let addr = addr.replace('_', ":");
+    if addr.contains(':') { Some(addr) } else { None }
 }
