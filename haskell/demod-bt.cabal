@@ -1,0 +1,81 @@
+cabal-version: 3.0
+name:          demod-bt
+version:       0.1.0.0
+license:       LGPL-3.0-or-later
+license-file:  ../LICENSE
+author:        Asher <info@demod.ltd>
+maintainer:    info@demod.ltd
+copyright:     (c) 2025 DeMoD LLC
+synopsis:      DeMoD BT - Haskell control plane for Bluetooth audio
+description:
+  Type-safe Bluetooth audio control plane using indexed monads for
+  AVDTP/AVRCP protocol state machines, D-Bus orchestration via BlueZ,
+  and DCF protocol logic. Real-time audio handled by Rust data plane
+  via FFI.
+  .
+  Part of the DeMoD Communications Framework.
+  LGPL-3.0 | Patent Pending | USAF Validated.
+
+category:      Bluetooth, Audio, Network
+build-type:    Simple
+
+common shared
+  default-language: GHC2021
+  default-extensions:
+    DataKinds
+    GADTs
+    TypeFamilies
+    OverloadedStrings
+    DerivingStrategies
+    DeriveGeneric
+    DeriveAnyClass
+    LambdaCase
+    RecordWildCards
+  ghc-options:
+    -Wall
+    -Wincomplete-patterns
+    -Wunused-imports
+    -O2
+    -- Enable the non-moving GC for lower latency on the control plane
+    -- (audio path is in Rust so this only affects D-Bus/protocol logic)
+    "-with-rtsopts=-xn"
+
+library
+  import: shared
+  hs-source-dirs: src
+  exposed-modules:
+    DeMoD.BT
+    DeMoD.BT.Types
+    DeMoD.BT.AVDTP
+    DeMoD.BT.AVRCP
+    DeMoD.BT.BlueZ
+    DeMoD.BT.DCF
+    DeMoD.BT.FFI
+  build-depends:
+    , base         >= 4.17 && < 5
+    , dbus         >= 1.3  && < 2
+    , text         >= 2.0  && < 3
+    , bytestring   >= 0.11 && < 1
+    , containers   >= 0.6  && < 1
+    , stm          >= 2.5  && < 3
+    , async        >= 2.2  && < 3
+    , mtl          >= 2.3  && < 3
+    , time         >= 1.12 && < 2
+    , binary       >= 0.8  && < 1
+
+  -- Link against the Rust static library for FFI
+  -- The Nix build copies libdemod_bt.a into the package lib dir
+  extra-libraries: demod_bt
+  -- Also need pthreads, dl, and m for the Rust runtime
+  extra-libraries: pthread dl m
+
+executable demod-bt-daemon
+  import: shared
+  hs-source-dirs: app
+  main-is: Main.hs
+  build-depends:
+    , base
+    , demod-bt
+    , text
+    , optparse-applicative >= 0.18 && < 1
+  ghc-options: -threaded -rtsopts

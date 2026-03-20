@@ -1,0 +1,61 @@
+[package]
+name = "demod-bt"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-or-later"
+description = "DeMoD BT data plane: Bluetooth audio transport, codecs, PipeWire integration"
+authors = ["Asher <info@demod.ltd>"]
+repository = "https://github.com/ALH477/demod-bt"
+
+[lib]
+name = "demod_bt"
+# Produce both a Rust library and a C-compatible static/dynamic library for Haskell FFI
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+# D-Bus (pure Rust, no libdbus dependency)
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+zvariant = "5"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+
+# Audio I/O
+# pipewire = "0.8"  # Enable when pipewire-rs builds cleanly in your Nix env
+cpal = "0.15"
+
+# Codecs - FFI to system libs
+# libsbc-sys and lc3-sys are built via pkg-config against Nix-provided libs
+
+# Lock-free audio transport
+rtrb = "0.3"           # Real-time ring buffer (SPSC, wait-free)
+
+# Serialization / DCF framing
+byteorder = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Misc
+bitflags = "2"
+parking_lot = "0.12"
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[features]
+default = ["sbc"]
+sbc = []
+lc3 = []
+aac = []
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "symbols"

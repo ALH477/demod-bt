@@ -1,0 +1,22 @@
+# Build artifacts
+/result
+/result-*
+/rust/target/
+/haskell/dist/
+/haskell/dist-newstyle/
+
+# Haskell outputs
+*.hi
+*.o
+*.dyn_o
+*.dyn_hi
+*.prof
+*.eventlog
+
+# Rust outputs
+*.rlib
+*.rmeta
+
+# Misc
+.DS_Store
+*.swp
