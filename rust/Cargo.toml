@@ -46,6 +46,10 @@ anyhow = "1"
 bitflags = "2"
 parking_lot = "0.12"
 
+# BLE GATT (BLE-MIDI peripheral). bluer is BlueZ's high-level Rust
+# binding, complementary to the raw zbus we use for A2DP.
+bluer = { version = "0.17", default-features = true, features = ["bluetoothd"] }
+
 [build-dependencies]
 pkg-config = "0.3"
 

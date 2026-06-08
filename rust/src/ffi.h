@@ -88,6 +88,18 @@ const char *demod_bt_version(void);
 char       *demod_bt_status(void);
 void        demod_bt_free_string(char *s);
 
+/* ── BLE-MIDI peripheral ──────────────────────────────────────── */
+/*
+ * BLE-MIDI is independent of the A2DP runtime — start it before,
+ * after, or without demod_bt_init. The peripheral advertises a
+ * single GATT service (Apple/MMA spec) so paired DAW hosts see the
+ * device as a standard MIDI input.
+ */
+
+int  demod_bt_midi_start(const char *device_name);     /* 0 on success */
+int  demod_bt_midi_send(const uint8_t *bytes, unsigned len);
+void demod_bt_midi_stop(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -23,6 +23,7 @@ use std::os::raw::{c_char, c_int, c_uint};
 use std::ptr;
 use std::sync::Once;
 
+use crate::ble_midi::BleMidiHandle;
 use crate::codec::AudioCodec;
 use crate::dcf::{DCF_HEADER_SIZE, DCF_OPTIMAL_PAYLOAD};
 use crate::runtime::Runtime;
@@ -34,6 +35,10 @@ use crate::transport::{AudioConfig, MetricsSnapshot, StreamDirection};
 
 static INIT: Once = Once::new();
 static mut RUNTIME: Option<Box<Runtime>> = None;
+
+/// BLE-MIDI peripheral. Independent from the A2DP runtime — can be
+/// started before, after, or without `demod_bt_init`.
+static mut MIDI: Option<Box<BleMidiHandle>> = None;
 
 fn init_logging() {
     INIT.call_once(|| {
@@ -466,5 +471,89 @@ pub extern "C" fn demod_bt_status() -> *mut c_char {
 pub extern "C" fn demod_bt_free_string(s: *mut c_char) {
     if !s.is_null() {
         unsafe { drop(CString::from_raw(s)) };
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// BLE-MIDI peripheral
+// ═══════════════════════════════════════════════════════════════════
+
+/// Bring up the BLE-MIDI peripheral (advertise + GATT service +
+/// notify characteristic). Once started, a paired DAW host sees the
+/// device as a standard MIDI input.
+///
+/// Independent of `demod_bt_init` — the audio plane and MIDI plane do
+/// not share state. Calling this twice is a no-op (returns 0).
+///
+/// device_name: NUL-terminated UTF-8 advertised local name; if NULL,
+///              defaults to "DeMoD MIDI".
+///
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn demod_bt_midi_start(device_name: *const c_char) -> c_int {
+    init_logging();
+    let name = if device_name.is_null() {
+        "DeMoD MIDI".to_string()
+    } else {
+        unsafe { CStr::from_ptr(device_name) }
+            .to_str()
+            .unwrap_or("DeMoD MIDI")
+            .to_string()
+    };
+
+    unsafe {
+        if MIDI.is_some() {
+            tracing::info!("BLE-MIDI already running");
+            return 0;
+        }
+        match BleMidiHandle::start(&name) {
+            Ok(h) => {
+                MIDI = Some(Box::new(h));
+                tracing::info!(name = %name, "BLE-MIDI peripheral started");
+                0
+            }
+            Err(e) => {
+                tracing::error!("BLE-MIDI start failed: {e:?}");
+                -1
+            }
+        }
+    }
+}
+
+/// Push a raw MIDI message (status + data bytes) to all subscribed
+/// peers. The BLE-MIDI framing (header + timestamp) is added inside.
+/// No-op if no clients are subscribed.
+///
+/// Returns 0 on success, -1 if the peripheral isn't running or the
+/// message is invalid (empty / null pointer).
+#[no_mangle]
+pub extern "C" fn demod_bt_midi_send(bytes: *const u8, len: c_uint) -> c_int {
+    if bytes.is_null() || len == 0 {
+        return -1;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(bytes, len as usize) };
+    unsafe {
+        match MIDI.as_ref() {
+            None => -1,
+            Some(m) => match m.send(slice) {
+                Ok(()) => 0,
+                Err(e) => {
+                    tracing::warn!("BLE-MIDI send failed: {e:?}");
+                    -1
+                }
+            },
+        }
+    }
+}
+
+/// Tear down the BLE-MIDI peripheral. Idempotent — safe to call when
+/// the peripheral is not running.
+#[no_mangle]
+pub extern "C" fn demod_bt_midi_stop() {
+    unsafe {
+        if let Some(h) = MIDI.take() {
+            (*h).stop();
+            tracing::info!("BLE-MIDI peripheral stopped");
+        }
     }
 }

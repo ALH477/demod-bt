@@ -12,6 +12,7 @@
 
 pub mod audio;
 pub mod avrcp;
+pub mod ble_midi;
 pub mod bluez;
 pub mod codec;
 pub mod compat;

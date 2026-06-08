@@ -115,6 +115,23 @@ in
         Requires Bluetooth 5.2+ hardware and BlueZ experimental features.
       '';
     };
+
+    midi = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Expose a BLE-MIDI peripheral via the Apple/MMA spec.
+
+          When true, downstream consumers (e.g. an orchestrator or
+          control daemon) may bring up the peripheral via
+          demod_bt_midi_start() from libdemod_bt. This option is a
+          policy flag — the demod-bt-daemon itself does not start the
+          peripheral. Tools like demod-orchestrator should read this
+          option and decide whether to call the BLE-MIDI FFI on boot.
+        '';
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -254,7 +271,7 @@ in
     # ── Packages ─────────────────────────────────────────────────
     environment.systemPackages = [
       pkg
-      pkgs.bluetoothctl
+      (pkgs.bluetoothctl or pkgs.bluez)
     ];
   };
 }
